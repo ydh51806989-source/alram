@@ -1,0 +1,119 @@
+name: GPT Pro 20X Discord Alert
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      send_test:
+        description: "Send a Discord test message"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Send Discord test message
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.send_test }}
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          test -n "$DISCORD_WEBHOOK_URL" || { echo "DISCORD_WEBHOOK_URL secret is missing"; exit 1; }
+          curl -fsS -H "Content-Type: application/json" \
+            -d '{"content":"✅ GPT Pro 20X 알림 테스트 성공"}' \
+            "$DISCORD_WEBHOOK_URL"
+
+      - name: Check official OpenAI pages
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.send_test) }}
+        id: status
+        run: |
+          python3 - <<'PY'
+          import html
+          import re
+          import sys
+          import urllib.request
+
+          urls = [
+              "https://help.openai.com/en/articles/9793128-what-is-chatgpt-pro",
+              "https://help.openai.com/en/articles/7232927-canceling-your-chatgpt-subscription",
+              "https://help.openai.com/en/articles/7242622-why-did-my-chatgpt-plus-or-chatgpt-pro-renewal-transaction-fail",
+          ]
+
+          headers = {"User-Agent": "Mozilla/5.0 (compatible; gpt-pro20x-alert/1.0)"}
+          pages = []
+
+          for url in urls:
+              try:
+                  req = urllib.request.Request(url, headers=headers)
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      raw = r.read().decode("utf-8", "ignore")
+              except Exception as e:
+                  print(f"Failed to fetch {url}: {e}")
+                  sys.exit(2)
+
+              raw = re.sub(r"<script\b[^>]*>.*?</script>", " ", raw, flags=re.I | re.S)
+              raw = re.sub(r"<style\b[^>]*>.*?</style>", " ", raw, flags=re.I | re.S)
+              text = re.sub(r"<[^>]+>", " ", raw)
+              text = html.unescape(text)
+              text = re.sub(r"\s+", " ", text).lower()
+              pages.append(text)
+
+          pause_markers = [
+              "temporarily pausing new sign-ups and upgrades",
+              "temporarily paused",
+              "new sign-ups and upgrades to the chatgpt pro $200 plan",
+              "cannot purchase pro $200 until the pause is lifted",
+              "until the pause is lifted",
+          ]
+
+          # Avoid a false alert if OpenAI merely redesigns one page:
+          # notify only when all three official English pages no longer contain
+          # the pause language and the Pro tiers page still clearly references
+          # the $200 / 20X tier.
+          any_pause = any(
+              any(marker in page for marker in pause_markers)
+              for page in pages
+          )
+          pro_page = pages[0]
+          tier_present = (
+              ("pro $200" in pro_page or "$200 pro" in pro_page or "pro 20x" in pro_page)
+              and ("20x" in pro_page or "20 times" in pro_page or "20×" in pro_page)
+          )
+
+          reopened = (not any_pause) and tier_present
+
+          with open("status.txt", "w", encoding="utf-8") as f:
+              f.write("true" if reopened else "false")
+
+          print("pause_language_present =", any_pause)
+          print("pro_200_tier_present =", tier_present)
+          print("reopened =", reopened)
+          PY
+
+          echo "reopened=$(cat status.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Discord once
+        if: ${{ steps.status.outputs.reopened == 'true' && hashFiles('.pro20x-alert-sent') == '' }}
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          test -n "$DISCORD_WEBHOOK_URL" || { echo "DISCORD_WEBHOOK_URL secret is missing"; exit 1; }
+
+          curl -fsS -H "Content-Type: application/json" \
+            -d '{"content":"🚨 **GPT Pro 20X 결제 재개 감지**\nOpenAI 공식 도움말에서 Pro $200 (Pro 20X) 신규 가입/업그레이드 일시 중지 안내가 해제된 것으로 감지됐습니다.\nhttps://help.openai.com/en/articles/9793128-what-is-chatgpt-pro"}' \
+            "$DISCORD_WEBHOOK_URL"
+
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .pro20x-alert-sent
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .pro20x-alert-sent
+          git commit -m "Record Pro 20X reactivation alert"
+          git push
